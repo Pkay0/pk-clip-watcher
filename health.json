@@ -1,0 +1,14 @@
+{
+  "scubaryan_": {
+    "consecutive_failures": 0
+  },
+  "FearedBuck": {
+    "consecutive_failures": 0
+  },
+  "yoxics": {
+    "consecutive_failures": 0
+  },
+  "all_failed_streak": 0,
+  "alert": false,
+  "alert_sent": false
+}

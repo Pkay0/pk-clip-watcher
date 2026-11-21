@@ -1,0 +1,125 @@
+# 10:30–01:50 America/New_York standard time (UTC-5). These UTC crons do not follow EDT.
+name: watch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 0-6,16-23 * * *"
+    - cron: "30,40,50 15 * * *"
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Run watcher
+        run: |
+          set -euo pipefail
+          python3 -u watch.py > /tmp/watch.stdout
+          cat /tmp/watch.stdout
+          echo "----- watch.log -----"
+          cat watch.log || true
+
+      - name: Notify webhook
+        env:
+          WATCHER_WEBHOOK_URL: ${{ secrets.WATCHER_WEBHOOK_URL }}
+          WATCHER_WEBHOOK_KEY: ${{ secrets.WATCHER_WEBHOOK_KEY }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          lines = open("/tmp/watch.stdout").read().splitlines()
+          new_line = next((ln[4:].strip() for ln in lines if ln.startswith("NEW ")), None)
+          clips_line = next((ln[6:] for ln in lines if ln.startswith("CLIPS ")), None)
+          if new_line is None or clips_line is None:
+              print("warning: watcher stdout missing NEW/CLIPS lines; skipping POST", file=sys.stderr)
+              open("/tmp/watch.meta", "w").write("0 0 0 0\n")
+              sys.exit(0)
+          try:
+              n = int(new_line)
+              clips = json.loads(clips_line)
+              if not isinstance(clips, list):
+                  raise ValueError("clips is not a list")
+          except Exception as e:
+              print(f"warning: could not parse watcher stdout ({e}); skipping POST", file=sys.stderr)
+              open("/tmp/watch.meta", "w").write("0 0 0 0\n")
+              sys.exit(0)
+          health = {}
+          if os.path.exists("health.json"):
+              with open("health.json") as f:
+                  health = json.load(f)
+          alert = bool(health.get("alert"))
+          alert_sent = bool(health.get("alert_sent"))
+          if n != len(clips):
+              print(f"warning: NEW {n} does not match {len(clips)} clips", file=sys.stderr)
+          should = n > 0 or (alert and not alert_sent)
+          body = {"source": "watcher", "new": n, "alert": alert, "clips": clips}
+          with open("/tmp/watch-payload.json", "w", encoding="utf-8") as f:
+              json.dump(body, f, ensure_ascii=False)
+              f.write("\n")
+          with open("/tmp/watch.meta", "w") as f:
+              f.write(f"{int(should)} {int(alert)} {int(alert_sent)} {n}\n")
+          print(f"new={n} alert={str(alert).lower()} alert_sent={str(alert_sent).lower()} post={str(should).lower()}")
+          PY
+          read -r should alert alert_sent newcount < /tmp/watch.meta
+          if [ "$should" != "1" ]; then
+            echo "no webhook post this run"
+            exit 0
+          fi
+          if [ -z "${WATCHER_WEBHOOK_URL:-}" ] || [ -z "${WATCHER_WEBHOOK_KEY:-}" ]; then
+            echo "warning: WATCHER_WEBHOOK_URL or WATCHER_WEBHOOK_KEY is empty; skipping POST" >&2
+            exit 0
+          fi
+          status=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            --retry 2 --max-time 30 \
+            -X POST \
+            -H "Authorization: Bearer ${WATCHER_WEBHOOK_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/watch-payload.json \
+            --url "${WATCHER_WEBHOOK_URL}" 2>/dev/null) || true
+          status=${status:-000}
+          echo "webhook HTTP status: ${status}"
+          case "$status" in
+            2*)
+              if [ "$alert" = "1" ] && [ "$alert_sent" = "0" ]; then
+                python3 -u watch.py --mark-alert-sent
+                echo "marked alert_sent for this episode"
+              fi
+              ;;
+          esac
+
+      - name: Commit watcher state
+        run: |
+          set -euo pipefail
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_EDITOR=true
+          branch="${GITHUB_REF_NAME}"
+          git checkout -B "${branch}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- state.json health.json
+          if git diff --cached --quiet; then
+            echo "no watcher state changes"
+            exit 0
+          fi
+          git diff --cached --stat
+          git commit -m "chore: update watcher state [skip ci]"
+          git pull --rebase origin "${branch}"
+          if ! git push origin "HEAD:${branch}"; then
+            echo "push rejected; rebasing once and retrying"
+            git pull --rebase origin "${branch}"
+            git push origin "HEAD:${branch}"
+          fi
