@@ -1,0 +1,5 @@
+watch.log
+__pycache__/
+*.tmp
+*.bak
+*.corrupt-*
